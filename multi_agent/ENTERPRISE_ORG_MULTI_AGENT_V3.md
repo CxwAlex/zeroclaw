@@ -1113,6 +1113,868 @@ CEO 回复：
 
 ---
 
+## 六、补充策略
+
+### 6.1 团队记忆共享机制
+
+#### 设计理念
+
+借鉴企业知识管理系统，实现**三层记忆共享**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        集群记忆 (CEO 层)                          │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  集群经验库                                               │    │
+│  │  - 成功项目案例（可复用的模式/流程）                       │    │
+│  │  - 失败项目复盘（避免的错误）                             │    │
+│  │  - 最佳实践库（各领域的标准工作流程）                      │    │
+│  │  - 资源使用统计（各模式的平均消耗）                       │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                              ↑                                   │
+│              CEO 主动推送 / 项目负责人查询                        │
+└─────────────────────────────────────────────────────────────────┘
+                              ↑
+┌─────────────────────────────────────────────────────────────────┐
+│                        项目记忆 (团队层)                          │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  项目知识库                                               │    │
+│  │  - 当前项目文档（所有 Worker 的产出）                       │    │
+│  │  - 中间成果（未完成但有价值的发现）                       │    │
+│  │  - 问题解决方案（已解决的技术难题）                       │    │
+│  │  - Worker 协作记录（沟通历史、决策记录）                   │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                              ↑                                   │
+│              项目负责人主动共享 / Worker 自动贡献                  │
+└─────────────────────────────────────────────────────────────────┘
+                              ↑
+┌─────────────────────────────────────────────────────────────────┐
+│                        Worker 记忆 (个体层)                       │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  工作记忆                                                 │    │
+│  │  - 当前任务上下文                                        │    │
+│  │  - 已尝试方案和结果                                      │    │
+│  │  - 临时数据和中间结果                                    │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 记忆共享流程
+
+```rust
+// src/agent/memory/sharing.rs
+
+/// 记忆共享管理器
+pub struct MemorySharingManager {
+    /// 集群经验库
+    cluster_experience: Arc<DashMap<String, ExperienceEntry>>,
+    /// 项目知识库
+    project_knowledge: Arc<DashMap<String, ProjectKnowledge>>,
+    /// 记忆访问统计（用于优化）
+    access_stats: DashMap<String, AccessStats>,
+}
+
+/// 经验条目（集群层）
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ExperienceEntry {
+    /// 经验类型
+    pub entry_type: ExperienceType,
+    /// 来源项目
+    pub source_project: String,
+    /// 经验描述
+    pub description: String,
+    /// 适用场景
+    pub applicable_scenarios: Vec<String>,
+    /// 可复用的模式/流程
+    pub reusable_pattern: Option<CollaborationPattern>,
+    /// 避免的错误
+    pub pitfalls_to_avoid: Vec<String>,
+    /// 贡献者（项目负责人）
+    pub contributor: String,
+    /// 贡献时间
+    pub contributed_at: DateTime<Utc>,
+    /// 被引用次数
+    pub citation_count: usize,
+    /// 有效性评分（0-1）
+    pub effectiveness_score: f32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum ExperienceType {
+    /// 成功经验（可复用）
+    SuccessStory,
+    /// 失败复盘（避免错误）
+    FailureReview,
+    /// 最佳实践
+    BestPractice,
+    /// 资源使用统计
+    ResourceStatistics,
+}
+
+/// 项目知识（团队层）
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProjectKnowledge {
+    /// 项目 ID
+    pub project_id: String,
+    /// 知识条目
+    pub entries: Vec<KnowledgeEntry>,
+    /// 共享状态
+    pub sharing_status: SharingStatus,
+    /// 最后更新
+    pub last_updated: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct KnowledgeEntry {
+    /// 知识类型
+    pub entry_type: KnowledgeType,
+    /// 贡献者（Worker ID）
+    pub contributor: String,
+    /// 知识内容
+    pub content: String,
+    /// 关联任务
+    pub related_task: Option<String>,
+    /// 被访问次数
+    pub access_count: usize,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub enum KnowledgeType {
+    /// 项目文档
+    Documentation,
+    /// 中间成果
+    IntermediateResult,
+    /// 问题解决方案
+    ProblemSolution,
+    /// 协作记录
+    CollaborationRecord,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum SharingStatus {
+    /// 私有（仅项目内可见）
+    Private,
+    /// 已申请共享（等待 CEO 审批）
+    PendingApproval,
+    /// 已共享到集群
+    SharedToCluster,
+    /// 推荐共享（CEO 标记为有价值）
+    RecommendedForSharing,
+}
+
+impl MemorySharingManager {
+    /// Worker 贡献知识到项目记忆
+    pub async fn worker_contribute(
+        &self,
+        project_id: &str,
+        worker_id: &str,
+        knowledge: KnowledgeEntry,
+    ) -> Result<()> {
+        let mut project = self.project_knowledge
+            .get_mut(project_id)
+            .ok_or("项目不存在")?;
+        
+        project.entries.push(knowledge);
+        project.last_updated = Utc::now();
+        
+        // 自动检查是否值得共享到集群
+        if self.is_worth_sharing(&knowledge) {
+            project.sharing_status = SharingStatus::RecommendedForSharing;
+            // 通知项目负责人
+            self.notify_team_lead(project_id, "发现潜在有价值知识，建议共享到集群").await?;
+        }
+        
+        Ok(())
+    }
+
+    /// 项目负责人主动共享到集群
+    pub async fn team_lead_share_to_cluster(
+        &self,
+        project_id: &str,
+        knowledge_ids: Vec<String>,
+        share_reason: &str,
+    ) -> Result<()> {
+        let project = self.project_knowledge
+            .get(project_id)
+            .ok_or("项目不存在")?;
+        
+        // 提取知识条目
+        let entries: Vec<_> = project.entries.iter()
+            .filter(|e| knowledge_ids.contains(&e.contributor))
+            .collect();
+        
+        // 创建集群经验条目
+        let experience = ExperienceEntry {
+            entry_type: ExperienceType::BestPractice,
+            source_project: project_id.clone(),
+            description: format!("来自{}项目的经验分享：{}", project_id, share_reason),
+            applicable_scenarios: self.extract_applicable_scenarios(&entries),
+            reusable_pattern: None, // 可选
+            pitfalls_to_avoid: vec![],
+            contributor: project_id.clone(),
+            contributed_at: Utc::now(),
+            citation_count: 0,
+            effectiveness_score: 0.5, // 初始值
+        };
+        
+        // 添加到集群经验库
+        self.cluster_experience.insert(
+            format!("{}_{}", project_id, Utc::now().timestamp()),
+            experience,
+        );
+        
+        // 更新项目共享状态
+        let mut project = self.project_knowledge.get_mut(project_id).unwrap();
+        project.sharing_status = SharingStatus::SharedToCluster;
+        
+        Ok(())
+    }
+
+    /// CEO 推送集群经验到项目
+    pub async fn ceo_push_to_project(
+        &self,
+        project_id: &str,
+        experience_id: &str,
+        push_reason: &str,
+    ) -> Result<()> {
+        let experience = self.cluster_experience
+            .get(experience_id)
+            .ok_or("经验不存在")?;
+        
+        // 创建项目知识条目
+        let knowledge = KnowledgeEntry {
+            entry_type: KnowledgeType::ProblemSolution,
+            contributor: "CEO".to_string(),
+            content: format!(
+                "【集群经验推荐】{}\n适用场景：{}\n{}\n推荐原因：{}",
+                experience.description,
+                experience.applicable_scenarios.join(", "),
+                experience.description,
+                push_reason
+            ),
+            related_task: None,
+            access_count: 0,
+        };
+        
+        // 添加到项目知识
+        let mut project = self.project_knowledge.get_mut(project_id).unwrap();
+        project.entries.push(knowledge);
+        project.last_updated = Utc::now();
+        
+        // 通知项目负责人
+        self.notify_team_lead(project_id, &format!(
+            "CEO 推送集群经验：{}，请查阅参考",
+            experience.description
+        )).await?;
+        
+        Ok(())
+    }
+
+    /// 项目完成时自动复盘
+    pub async fn auto_review_on_completion(
+        &self,
+        project_id: &str,
+        project_result: &ProjectResult,
+    ) -> Result<()> {
+        // 分析项目结果
+        let review = self.generate_project_review(project_result).await?;
+        
+        // 创建经验条目
+        let experience = ExperienceEntry {
+            entry_type: if project_result.success {
+                ExperienceType::SuccessStory
+            } else {
+                ExperienceType::FailureReview
+            },
+            source_project: project_id.to_string(),
+            description: review.summary,
+            applicable_scenarios: review.applicable_scenarios,
+            reusable_pattern: review.reusable_pattern,
+            pitfalls_to_avoid: review.pitfalls,
+            contributor: project_id.to_string(),
+            contributed_at: Utc::now(),
+            citation_count: 0,
+            effectiveness_score: if project_result.success { 0.8 } else { 0.5 },
+        };
+        
+        // 自动添加到集群经验库
+        self.cluster_experience.insert(
+            format!("review_{}_{}", project_id, Utc::now().timestamp()),
+            experience,
+        );
+        
+        Ok(())
+    }
+
+    /// 查询集群经验（供项目负责人参考）
+    pub async fn query_cluster_experience(
+        &self,
+        project_context: &str,
+        top_k: usize,
+    ) -> Vec<ExperienceEntry> {
+        let mut all_entries: Vec<_> = self.cluster_experience.iter()
+            .map(|e| e.value().clone())
+            .collect();
+        
+        // 按相关性排序
+        all_entries.sort_by(|a, b| {
+            let score_a = self.calculate_relevance(a, project_context);
+            let score_b = self.calculate_relevance(b, project_context);
+            score_b.partial_cmp(&score_a).unwrap()
+        });
+        
+        // 返回 Top-K
+        all_entries.into_iter().take(top_k).collect()
+    }
+
+    /// 检查知识是否值得共享
+    fn is_worth_sharing(&self, knowledge: &KnowledgeEntry) -> bool {
+        // 启发式规则：
+        // 1. 问题解决方案类型
+        // 2. 内容长度>500 字（详细说明）
+        // 3. 包含关键词（"突破"、"创新"、"首次"等）
+        
+        if knowledge.entry_type != KnowledgeType::ProblemSolution {
+            return false;
+        }
+        
+        if knowledge.content.len() < 500 {
+            return false;
+        }
+        
+        let valuable_keywords = ["突破", "创新", "首次", "最佳实践", "推荐", "重要"];
+        valuable_keywords.iter().any(|kw| knowledge.content.contains(kw))
+    }
+
+    /// 计算经验相关性
+    fn calculate_relevance(&self, experience: &ExperienceEntry, context: &str) -> f32 {
+        let mut score = 0.0;
+        
+        // 场景匹配（40%）
+        for scenario in &experience.applicable_scenarios {
+            if context.contains(scenario) {
+                score += 0.4;
+                break;
+            }
+        }
+        
+        // 引用次数（30%）
+        score += (experience.citation_count.min(10) as f32) * 0.03;
+        
+        // 有效性评分（30%）
+        score += experience.effectiveness_score * 0.3;
+        
+        score.min(1.0)
+    }
+}
+
+/// 项目复盘报告
+struct ProjectReview {
+    summary: String,
+    applicable_scenarios: Vec<String>,
+    reusable_pattern: Option<CollaborationPattern>,
+    pitfalls: Vec<String>,
+}
+```
+
+#### 记忆共享示例
+
+```
+场景 1: Worker 贡献知识
+
+Worker Agent (市场研究员):
+"我发现了一个新的数据来源，可以获取更准确的市场规模数据。"
+→ 自动贡献到项目记忆
+→ 项目负责人标记为"有价值"
+→ CEO 审批后共享到集群经验库
+→ 其他项目可以查询使用
+
+场景 2: CEO 推送经验
+
+CEO:
+"检测到你们正在进行市场调研，集群经验库中有 3 个相关成功案例，
+已推送到项目记忆，请参考。"
+→ 项目负责人查看推送
+→ 应用到当前项目
+→ 提升效率
+
+场景 3: 项目完成自动复盘
+
+项目完成:
+"AI 编程助手市场调研"项目完成，质量评分 4.8/5
+→ 自动创建成功经验条目
+→ 添加到集群经验库
+→ 标记为"市场调研最佳实践"
+→ 后续类似项目可参考
+```
+
+---
+
+### 6.2 Worker 自动重试与状态检查机制
+
+#### 设计理念
+
+借鉴大数据集群（如 Kubernetes、Spark）的**健康检查 + 自动恢复**机制：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Worker 生命周期管理                            │
+│                                                                  │
+│  创建 → 初始化 → 运行中 → 完成任务 → 销毁                        │
+│           ↑        │                                              │
+│           │        ▼                                              │
+│           │    ┌─────────┐                                       │
+│           │    │状态检查 │                                       │
+│           │    └────┬────┘                                       │
+│           │         │                                            │
+│           │    ┌────┴────┐                                       │
+│           │    ▼         ▼                                       │
+│           │  健康      异常                                       │
+│           │   │          │                                        │
+│           │   │    ┌─────┴─────┐                                 │
+│           │   │    │ 自动重试  │                                 │
+│           │   │    │ (最多 3 次) │                                 │
+│           │   │    └─────┬─────┘                                 │
+│           │   │          │                                        │
+│           │   │    ┌─────┴─────┐                                 │
+│           │   │    ▼         ▼                                   │
+│           │   │  成功     失败                                   │
+│           │   │   │        │                                     │
+│           │   │   │    ┌───┴───┐                                 │
+│           │   │   │    │升级   │                                 │
+│           │   │   │    │负责人 │                                 │
+│           │   │   │    └───────┘                                 │
+│           │   │                                                  │
+│           │  继续运行                                            │
+│           │                                                      │
+│           └──────────────────────────────────────────────────────┘
+│                        心跳保活（每 30 秒）
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 状态检查与重试实现
+
+```rust
+// src/agent/worker/health_check.rs
+
+use tokio::time::{interval, Duration};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Worker 健康状态
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerHealthStatus {
+    /// 初始化中
+    Initializing,
+    /// 正常运行
+    Healthy,
+    /// 忙碌中（执行任务）
+    Busy,
+    /// 响应缓慢
+    Slow,
+    /// 异常（可恢复）
+    Unhealthy,
+    /// 失败（不可恢复）
+    Failed,
+    /// 已终止
+    Terminated,
+}
+
+/// Worker 健康检查器
+pub struct WorkerHealthChecker {
+    /// Worker ID
+    worker_id: String,
+    /// 当前状态
+    status: AtomicU8, // 使用 AtomicU8 存储 WorkerHealthStatus
+    /// 心跳间隔（秒）
+    heartbeat_interval_secs: u64,
+    /// 超时阈值（秒）
+    timeout_threshold_secs: u64,
+    /// 最大重试次数
+    max_retry_count: u8,
+    /// 当前重试次数
+    current_retry_count: AtomicU8,
+    /// 任务执行统计
+    task_stats: TaskStatistics,
+}
+
+/// 任务统计
+#[derive(Clone, Default)]
+pub struct TaskStatistics {
+    /// 总任务数
+    pub total_tasks: usize,
+    /// 成功任务数
+    pub successful_tasks: usize,
+    /// 失败任务数
+    pub failed_tasks: usize,
+    /// 重试任务数
+    pub retried_tasks: usize,
+    /// 平均执行时间（毫秒）
+    pub avg_execution_time_ms: f64,
+}
+
+/// 自动重试策略
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// 最大重试次数
+    pub max_retries: u8,
+    /// 初始退避时间（毫秒）
+    pub initial_backoff_ms: u64,
+    /// 最大退避时间（毫秒）
+    pub max_backoff_ms: u64,
+    /// 退避乘数
+    pub backoff_multiplier: f32,
+    /// 可重试的错误类型
+    pub retryable_errors: Vec<WorkerErrorType>,
+}
+
+/// Worker 错误类型
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum WorkerErrorType {
+    /// 网络超时
+    NetworkTimeout,
+    /// API 限流
+    RateLimited,
+    /// 临时服务不可用
+    TemporaryUnavailable,
+    /// 资源不足
+    InsufficientResources,
+    /// 任务执行超时
+    TaskTimeout,
+    /// 其他可恢复错误
+    OtherRecoverable,
+    /// 不可恢复错误
+    Unrecoverable,
+}
+
+impl WorkerHealthChecker {
+    /// 创建健康检查器
+    pub fn new(worker_id: String, config: &HealthCheckConfig) -> Self {
+        Self {
+            worker_id,
+            status: AtomicU8::new(WorkerHealthStatus::Initializing as u8),
+            heartbeat_interval_secs: config.heartbeat_interval_secs,
+            timeout_threshold_secs: config.timeout_threshold_secs,
+            max_retry_count: config.max_retry_count,
+            current_retry_count: AtomicU8::new(0),
+            task_stats: TaskStatistics::default(),
+        }
+    }
+
+    /// 启动健康检查循环
+    pub async fn start_health_check_loop(
+        self: Arc<Self>,
+        worker: Arc<WorkerAgent>,
+    ) -> Result<()> {
+        let mut heartbeat_interval = interval(Duration::from_secs(self.heartbeat_interval_secs));
+        let mut status_check_interval = interval(Duration::from_secs(10)); // 每 10 秒检查状态
+
+        loop {
+            tokio::select! {
+                // 心跳
+                _ = heartbeat_interval.tick() => {
+                    self.send_heartbeat(&worker).await?;
+                }
+                // 状态检查
+                _ = status_check_interval.tick() => {
+                    self.check_status(&worker).await?;
+                }
+            }
+        }
+    }
+
+    /// 发送心跳
+    async fn send_heartbeat(&self, worker: &WorkerAgent) -> Result<()> {
+        let status = self.get_status();
+        
+        // 向团队负责人发送心跳
+        worker.report_to_lead(&format!(
+            "心跳：状态={:?}, 任务统计={:?}",
+            status, self.task_stats
+        )).await?;
+        
+        Ok(())
+    }
+
+    /// 检查状态
+    async fn check_status(&self, worker: &WorkerAgent) -> Result<()> {
+        let current_status = self.get_status();
+        
+        match current_status {
+            WorkerHealthStatus::Healthy | WorkerHealthStatus::Busy => {
+                // 正常，无需操作
+            }
+            WorkerHealthStatus::Slow => {
+                // 响应缓慢，记录日志
+                tracing::warn!(worker_id = %self.worker_id, "Worker 响应缓慢");
+            }
+            WorkerHealthStatus::Unhealthy => {
+                // 异常，尝试自动恢复
+                self.attempt_auto_recovery(worker).await?;
+            }
+            WorkerHealthStatus::Failed => {
+                // 失败，通知团队负责人
+                worker.escalate_to_lead(&format!(
+                    "Worker {} 失败，任务统计：{:?}",
+                    self.worker_id, self.task_stats
+                )).await?;
+            }
+            _ => {}
+        }
+        
+        Ok(())
+    }
+
+    /// 尝试自动恢复
+    async fn attempt_auto_recovery(&self, worker: &WorkerAgent) -> Result<()> {
+        let current_retry = self.current_retry_count.load(Ordering::Relaxed);
+        
+        if current_retry >= self.max_retry_count {
+            // 超过最大重试次数，标记为失败
+            self.set_status(WorkerHealthStatus::Failed);
+            return Err("超过最大重试次数".into());
+        }
+        
+        // 计算退避时间（指数退避）
+        let backoff_ms = self.calculate_backoff(current_retry);
+        tracing::info!(
+            worker_id = %self.worker_id,
+            retry_count = current_retry,
+            backoff_ms = backoff_ms,
+            "尝试自动恢复"
+        );
+        
+        // 等待退避时间
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        
+        // 重置 Worker 状态
+        worker.reset_state().await?;
+        
+        // 重试当前任务
+        if let Some(task) = &worker.current_task {
+            self.current_retry_count.fetch_add(1, Ordering::Relaxed);
+            self.task_stats.retried_tasks += 1;
+            
+            match worker.retry_task(task).await {
+                Ok(_) => {
+                    // 重试成功
+                    self.set_status(WorkerHealthStatus::Healthy);
+                    self.current_retry_count.store(0, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // 重试失败，继续累加重试次数
+                    tracing::error!(worker_id = %self.worker_id, error = %e, "重试失败");
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// 计算退避时间（指数退避 + 抖动）
+    fn calculate_backoff(&self, retry_count: u8) -> u64 {
+        let policy = RetryPolicy {
+            max_retries: 3,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 60000,
+            backoff_multiplier: 2.0,
+            retryable_errors: vec![
+                WorkerErrorType::NetworkTimeout,
+                WorkerErrorType::RateLimited,
+                WorkerErrorType::TemporaryUnavailable,
+            ],
+        };
+        
+        // 指数退避
+        let backoff = policy.initial_backoff_ms as f64
+            * policy.backoff_multiplier.pow(retry_count as u32) as f64;
+        
+        // 限制最大值
+        let capped_backoff = backoff.min(policy.max_backoff_ms as f64);
+        
+        // 添加抖动（±20%），避免多个 Worker 同时重试
+        let jitter = (rand::random::<f64>() * 0.4 - 0.2) * capped_backoff;
+        
+        (capped_backoff + jitter) as u64
+    }
+
+    /// 执行任务（带状态跟踪）
+    pub async fn execute_task_with_monitoring(
+        &self,
+        worker: &WorkerAgent,
+        task: &SubTask,
+    ) -> Result<TaskResult> {
+        let start_time = Instant::now();
+        
+        // 设置状态为忙碌
+        self.set_status(WorkerHealthStatus::Busy);
+        
+        // 执行任务
+        let result = match tokio::time::timeout(
+            Duration::from_secs(self.timeout_threshold_secs),
+            worker.execute_task(task),
+        ).await {
+            Ok(Ok(result)) => {
+                // 成功
+                let duration = start_time.elapsed().as_millis() as f64;
+                self.update_stats(true, duration);
+                self.set_status(WorkerHealthStatus::Healthy);
+                result
+            }
+            Ok(Err(e)) => {
+                // 执行错误
+                let error_type = self.classify_error(&e);
+                if self.is_retryable(&error_type) {
+                    self.set_status(WorkerHealthStatus::Unhealthy);
+                } else {
+                    self.set_status(WorkerHealthStatus::Failed);
+                }
+                self.update_stats(false, 0.0);
+                return Err(e);
+            }
+            Err(_) => {
+                // 超时
+                tracing::error!(worker_id = %self.worker_id, "任务执行超时");
+                self.set_status(WorkerHealthStatus::Unhealthy);
+                self.update_stats(false, 0.0);
+                return Err("任务执行超时".into());
+            }
+        };
+        
+        Ok(result)
+    }
+
+    /// 更新统计
+    fn update_stats(&self, success: bool, execution_time_ms: f64) {
+        self.task_stats.total_tasks += 1;
+        if success {
+            self.task_stats.successful_tasks += 1;
+        } else {
+            self.task_stats.failed_tasks += 1;
+        }
+        
+        // 更新平均执行时间（移动平均）
+        let n = self.task_stats.total_tasks as f64;
+        self.task_stats.avg_execution_time_ms =
+            (self.task_stats.avg_execution_time_ms * (n - 1.0) + execution_time_ms) / n;
+    }
+
+    /// 错误分类
+    fn classify_error(&self, error: &Error) -> WorkerErrorType {
+        let error_str = error.to_string().to_lowercase();
+        
+        if error_str.contains("timeout") || error_str.contains("timed out") {
+            WorkerErrorType::NetworkTimeout
+        } else if error_str.contains("rate limit") || error_str.contains("429") {
+            WorkerErrorType::RateLimited
+        } else if error_str.contains("unavailable") || error_str.contains("503") {
+            WorkerErrorType::TemporaryUnavailable
+        } else if error_str.contains("memory") || error_str.contains("quota") {
+            WorkerErrorType::InsufficientResources
+        } else {
+            WorkerErrorType::Unrecoverable
+        }
+    }
+
+    /// 检查是否可重试
+    fn is_retryable(&self, error_type: &WorkerErrorType) -> bool {
+        let policy = RetryPolicy {
+            max_retries: 3,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 60000,
+            backoff_multiplier: 2.0,
+            retryable_errors: vec![
+                WorkerErrorType::NetworkTimeout,
+                WorkerErrorType::RateLimited,
+                WorkerErrorType::TemporaryUnavailable,
+            ],
+        };
+        
+        policy.retryable_errors.contains(error_type)
+    }
+
+    /// 获取状态
+    fn get_status(&self) -> WorkerHealthStatus {
+        let status_code = self.status.load(Ordering::Relaxed);
+        match status_code {
+            0 => WorkerHealthStatus::Initializing,
+            1 => WorkerHealthStatus::Healthy,
+            2 => WorkerHealthStatus::Busy,
+            3 => WorkerHealthStatus::Slow,
+            4 => WorkerHealthStatus::Unhealthy,
+            5 => WorkerHealthStatus::Failed,
+            _ => WorkerHealthStatus::Terminated,
+        }
+    }
+
+    /// 设置状态
+    fn set_status(&self, status: WorkerHealthStatus) {
+        self.status.store(status as u8, Ordering::Relaxed);
+    }
+}
+
+/// 健康检查配置
+#[derive(Clone)]
+pub struct HealthCheckConfig {
+    /// 心跳间隔（秒）
+    pub heartbeat_interval_secs: u64,
+    /// 超时阈值（秒）
+    pub timeout_threshold_secs: u64,
+    /// 最大重试次数
+    pub max_retry_count: u8,
+    /// 缓慢阈值（毫秒）
+    pub slow_threshold_ms: u64,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_secs: 30,
+            timeout_threshold_secs: 300,
+            max_retry_count: 3,
+            slow_threshold_ms: 10000,
+        }
+    }
+}
+```
+
+#### 重试机制示例
+
+```
+场景：Worker 执行任务失败自动重试
+
+Worker A 执行任务 "搜索 AI 编程助手市场数据"
+
+第 1 次尝试:
+→ 调用 web_search API
+→ 网络超时（>30 秒）
+→ 错误分类：NetworkTimeout（可重试）
+→ 状态设置为 Unhealthy
+→ 等待 1 秒（初始退避）
+
+第 2 次尝试:
+→ 调用 web_search API
+→ API 返回 429 Rate Limited
+→ 错误分类：RateLimited（可重试）
+→ 等待 2 秒（指数退避）
+
+第 3 次尝试:
+→ 调用 web_search API
+→ 成功获取数据
+→ 状态恢复为 Healthy
+→ 重试计数清零
+→ 任务完成
+
+如果第 3 次仍失败:
+→ 等待 4 秒（继续指数退避）
+→ 第 4 次尝试（超过最大重试次数 3）
+→ 状态设置为 Failed
+→ 升级通知团队负责人
+→ 负责人决定：重新分配任务/调整策略
+```
+
+---
+
 ## 七、实现计划（10 周）
 
 | 阶段 | 内容 | 工期 | 里程碑 |
